@@ -47,6 +47,16 @@ class VersionOut(BaseModel):
     is_current: bool
     created_at: datetime
     species_count: int
+    retired_at: datetime | None = Field(
+        None, description="退役时间；非空表示该过渡版已撤出日常供数链"
+    )
+
+
+class RetireOut(BaseModel):
+    version_code: str
+    retired_at: datetime = Field(..., description="退役生效时间")
+    serving_from_version: str = Field(..., description="退役后前驱仍按供数链相连")
+    serving_to_version: str = Field(..., description="退役后后继仍按供数链相连")
 
 
 class IdentificationCreate(BaseModel):

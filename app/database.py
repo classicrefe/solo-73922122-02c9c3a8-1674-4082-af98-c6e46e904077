@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS checklist_versions (
     name             TEXT NOT NULL,
     parent_version   TEXT REFERENCES checklist_versions(version_code),
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    is_current       INTEGER NOT NULL DEFAULT 1
+    is_current       INTEGER NOT NULL DEFAULT 1,
+    -- 非空表示该过渡版已退役：撤出日常取数链，但清单/映射/鉴定档案保留可查
+    retired_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS species (
@@ -67,6 +69,31 @@ CREATE TABLE IF NOT EXISTS code_mappings (
 
 CREATE INDEX IF NOT EXISTS idx_map_lookup
     ON code_mappings(from_version, to_version, from_code);
+
+-- 日常供数使用的“当前映射链”：只连接未退役的相邻版本。
+-- 退役时把跨过退役版的映射合成后写入这里，code_mappings 保持发布时原样留档。
+CREATE TABLE IF NOT EXISTS serving_mappings (
+    from_version      TEXT NOT NULL,
+    to_version        TEXT NOT NULL,
+    from_code         TEXT NOT NULL,
+    to_code           TEXT NOT NULL,
+    FOREIGN KEY (from_version) REFERENCES checklist_versions(version_code),
+    FOREIGN KEY (to_version) REFERENCES checklist_versions(version_code),
+    FOREIGN KEY (from_version, from_code)
+        REFERENCES species(version_code, species_code),
+    FOREIGN KEY (to_version, to_code)
+        REFERENCES species(version_code, species_code),
+    PRIMARY KEY (from_version, to_version, from_code, to_code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_serving_lookup
+    ON serving_mappings(from_version, to_version, from_code);
+
+-- 迁移标记（记录一次性数据迁移是否已执行），避免依赖“表是否为空”的启发式
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -92,6 +119,34 @@ def get_conn() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """针对已存在的旧库做增量迁移（幂等）。
+
+    - 旧库无 retired_at 列时补列；
+    - 首次升级（以 schema_meta 标记）把已发布的相邻映射回填到 serving_mappings，
+      使既有行为与升级前完全一致。
+    """
+    cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(checklist_versions)").fetchall()
+    }
+    if "retired_at" not in cols:
+        conn.execute("ALTER TABLE checklist_versions ADD COLUMN retired_at TEXT")
+
+    marker = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'serving_backfill_v1'"
+    ).fetchone()
+    if marker is None:
+        conn.execute(
+            "INSERT OR IGNORE INTO serving_mappings"
+            "(from_version, to_version, from_code, to_code) "
+            "SELECT from_version, to_version, from_code, to_code FROM code_mappings"
+        )
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('serving_backfill_v1', 'done')"
+        )
+
+
 def init_db(db_path: str | None = None) -> None:
     """建库建表，并确保仅保留一个现行版。"""
     path = db_path or DB_PATH
@@ -100,5 +155,6 @@ def init_db(db_path: str | None = None) -> None:
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()

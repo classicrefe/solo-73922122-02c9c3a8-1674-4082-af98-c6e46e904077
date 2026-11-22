@@ -237,6 +237,71 @@ def test_multi_hop_v3():
     assert qrc["to_codes"] == ["QRC99X", "QRC99Y"]
 
 
+def test_retire_validation_and_archive():
+    """退役：资格校验、失败不改供数、原资料留档、后续登记被拒。"""
+    # 现行版 v3、首版 v1 均不可退役
+    assert client.post("/versions/v3/retire").status_code == 409
+    assert client.post("/versions/v1/retire").status_code == 409
+    assert client.post("/versions/v9/retire").status_code == 404
+
+    # v2 上还有有效鉴定（S-CONF 的 QRC01 系在 v1；此处先登记一份 v2）
+    r = client.post(
+        "/identifications",
+        json={"specimen_no": "S-RET", "version_code": "v2", "species_code": "PIN01A"},
+    )
+    assert r.status_code == 200
+    rid = r.json()["id"]
+    block = client.post("/versions/v2/retire")
+    assert block.status_code == 409 and "有效鉴定" in block.json()["detail"]
+    # 失败时供数链完全不变
+    served = client.get("/versions/v1/mappings/serving").json()
+    assert served and served[0]["to_version"] == "v2"
+
+    # 撤回后可退役
+    assert client.post(f"/identifications/{rid}/withdraw").status_code == 200
+    r = client.post("/versions/v2/retire")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["version_code"] == "v2" and body["retired_at"] is not None
+    assert (body["serving_from_version"], body["serving_to_version"]) == ("v1", "v3")
+
+    # 原版清单、发布时去向、鉴定档案仍按原接口可查
+    assert client.get("/versions/v2/species").status_code == 200
+    assert len(client.get("/versions/v2/mappings/outgoing").json()) == 5
+    archived = client.get("/identifications", params={"specimen_no": "S-RET"}).json()
+    assert len(archived) == 1 and archived[0]["version_code"] == "v2"
+    assert archived[0]["status"] == "withdrawn"
+
+    # 供数改走跨过 v2 的直接映射：v1 → v3
+    served = client.get("/versions/v1/mappings/serving").json()
+    assert {m["to_version"] for m in served} == {"v3"}
+    assert all(set(m["to_codes"]) for m in served)
+
+    # 向已退役版登记 / 重新发布 / 重复退役均提示已退役
+    r = client.post(
+        "/identifications",
+        json={"specimen_no": "S-RET2", "version_code": "v2", "species_code": "PIN01A"},
+    )
+    assert r.status_code == 409 and "退役" in r.json()["detail"]
+    r = client.post("/versions", json={**V2, "name": "再来一次"})
+    assert r.status_code == 409 and "退役" in r.json()["detail"]
+    r = client.post("/versions/v2/retire")
+    assert r.status_code == 409 and "已退役" in r.json()["detail"]
+
+    # 版本列表可看出退役状态，现行版仍是 v3
+    versions = {v["version_code"]: v for v in client.get("/versions").json()}
+    assert versions["v2"]["retired_at"] is not None
+    assert versions["v3"]["is_current"] is True
+    assert client.get("/versions/current").json()["current_version"] == "v3"
+
+    # 退役后既有查询结论逐份保持一致（v1 登记的两份 QRC 并到 QRC99X/Y）
+    res = client.get("/specimens/S-CONF/resolution").json()
+    assert res["status"] == "review"
+    assert set(res["candidates"]) == {"QRC99X", "QRC99Y"}
+    chain = res["active_identifications"][0]["chain"]
+    assert [s["version"] for s in chain] == ["v1", "v3"]  # 跨过 v2
+
+
 def test_snapshot_consistency_under_concurrent_writes():
     """换版期间反复查询，单次查询内部必须始终自洽（同一快照）。"""
     import threading

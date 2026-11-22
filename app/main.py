@@ -5,7 +5,9 @@
 2. POST /identifications 登记鉴定；
 3. GET /specimens/{specimen_no}/resolution 查看现行候选物种；
 4. POST /versions 发布 v2（请求体给出拆种/并种映射），再查结论变化；
-5. POST /identifications/{id}/withdraw 撤回鉴定，再查结论变化。
+5. POST /identifications/{id}/withdraw 撤回鉴定，再查结论变化；
+6. POST /versions/{version_code}/retire 退役过渡版，再用
+   GET /versions/{version_code}/mappings/serving 查看跨过退役版的直接映射。
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from .schemas import (
     IdentificationOut,
     MappingOut,
     ResolutionOut,
+    RetireOut,
     SpeciesIn,
     VersionCreate,
     VersionOut,
@@ -33,6 +36,7 @@ from .services import (
     register_identification,
     resolve_specimen,
     bootstrap_version,
+    retire_version,
     withdraw_identification,
 )
 
@@ -50,9 +54,11 @@ app = FastAPI(
         "与并种（多个代码→同一代码）。本服务按现行名录对每份有效鉴定逐版转换，"
         "取候选物种交集：唯一→可入库，多个→待复核，无交集→鉴定冲突，"
         "无有效鉴定→未鉴定。换版为原子事务，失败则继续按原名录供数；"
-        "查询在单快照内完成，换版期间登记/撤回不影响查询一致性。"
+        "查询在单快照内完成，换版期间登记/撤回不影响查询一致性。\n\n"
+        "过渡名录可按版号退役：退役后撤出日常取数链（供数改走跨过该版的直接映射），"
+        "原版清单、发布时去向与鉴定档案仍按原接口留档可查。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -167,6 +173,62 @@ def version_mappings(version_code: str, conn=Depends(get_db)) -> list[dict]:
     return list(result.values())
 
 
+@app.get(
+    "/versions/{version_code}/mappings/serving",
+    tags=["名录版本"],
+    summary="某版在日常供数链上的直接去向（退役后跨过被退役版本的映射）",
+    response_model=list[MappingOut],
+)
+def serving_mappings(version_code: str, conn=Depends(get_db)) -> list[dict]:
+    if not conn.execute(
+        "SELECT 1 FROM checklist_versions WHERE version_code=?", (version_code,)
+    ).fetchone():
+        raise HTTPException(404, f"版本 {version_code} 不存在")
+    rows = conn.execute(
+        "SELECT from_version, to_version, from_code, to_code FROM serving_mappings "
+        "WHERE from_version=? ORDER BY from_code, to_code",
+        (version_code,),
+    ).fetchall()
+    result: dict[str, dict] = {}
+    for r in rows:
+        item = result.setdefault(
+            r["from_code"],
+            {
+                "from_version": r["from_version"],
+                "to_version": r["to_version"],
+                "from_code": r["from_code"],
+                "to_codes": [],
+            },
+        )
+        item["to_codes"].append(r["to_code"])
+    return list(result.values())
+
+
+@app.post(
+    "/versions/{version_code}/retire",
+    tags=["名录版本"],
+    summary="退役一个过渡版（非首版、非现行版、且无有效鉴定登记在该版）",
+    response_model=RetireOut,
+    responses={
+        404: {"description": "版号不存在"},
+        409: {
+            "description": (
+                "不可退役：首版/现行版/已有退役记录/仍有有效鉴定登记在该版；"
+                "失败时供数链与鉴定登记保持原状"
+            )
+        },
+    },
+)
+def retire(version_code: str, conn=Depends(get_db)) -> dict:
+    row, pred, succ = retire_version(conn, version_code)
+    return {
+        "version_code": row["version_code"],
+        "retired_at": row["retired_at"],
+        "serving_from_version": pred,
+        "serving_to_version": succ,
+    }
+
+
 # ---------- 鉴定 ----------
 
 @app.post(
@@ -245,6 +307,7 @@ def _version_dict(row: sqlite3.Row) -> dict:
         "is_current": bool(row["is_current"]),
         "created_at": row["created_at"],
         "species_count": row["species_count"],
+        "retired_at": row["retired_at"],
     }
 
 
